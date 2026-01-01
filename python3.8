@@ -1,0 +1,20 @@
+#!/bin/bash
+#
+# Copyright © Cloud Linux GmbH & Cloud Linux Software, Inc 2010-2021 All Rights Reserved
+#
+# Licensed under CLOUD LINUX LICENSE AGREEMENT
+# http://cloudlinux.com/docs/LICENCE.TXT
+#
+
+if [[ $EUID -eq 0 ]]; then
+   echo "This program is not intended to be run as root." 1>&2
+   exit 1
+fi
+
+CWD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source ${CWD}/activate
+CL_PYTHON_VERSION="$(echo "${VIRTUAL_ENV}" | awk -F '/' '{print $NF}')"
+eval $(${CWD}/set_env_vars.py python)
+
+ABSOLUTE_PATH="${CWD}/python${CL_PYTHON_VERSION}_bin"
+exec "${ABSOLUTE_PATH}" "$@"
