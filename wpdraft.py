@@ -50,6 +50,10 @@ class Document:
     dirty: bool = False
     path: Optional[Path] = None
 
+ # NEW: selection (0-based, end-exclusive)
+    sel_start: int = 0
+    sel_end: int = 0
+
     def set_text(self, new_text: str) -> None:
         self.text = new_text
         self._clamp_spans()
@@ -99,6 +103,141 @@ class Document:
                 f"existing {sp.start}-{sp.end}"
             )
 
+    def set_selection(self, a: int, b: int) -> None:
+        n = len(self.text)
+        a = max(0, min(a, n))
+        b = max(0, min(b, n))
+        self.sel_start, self.sel_end = a, b
+
+    def toggle_attr_on_selection(self, attr: str) -> None:
+        if attr not in ALLOWED_ATTRS:
+            raise ValueError(f"Bad attr: {attr}")
+        a, b = sorted((self.sel_start, self.sel_end))
+        if a == b:
+            return
+
+        if self._range_fully_has_attr(a, b, attr):
+            self._remove_attr_range(a, b, attr)
+        else:
+            self._add_attr_range(a, b, attr)
+
+        self._normalize_spans()
+        self.dirty = True
+
+# ---------- helpers for toggle ----------
+
+    def _range_fully_has_attr(self, a: int, b: int, attr: str) -> bool:
+        """Return True if [a,b) is completely covered by spans containing attr."""
+        covered = a
+        for sp in sorted(self.spans, key=lambda s: (s.start, s.end)):
+            if attr not in sp.attrs:
+                continue
+            if sp.end <= covered:
+                continue
+            if sp.start > covered:
+                return False
+            covered = max(covered, sp.end)
+            if covered >= b:
+                return True
+        return covered >= b
+
+    def _add_attr_range(self, a: int, b: int, attr: str) -> None:
+        """Add attr to [a,b), splitting spans as needed to avoid partial overlaps."""
+        new_spans: List[Span] = []
+        for sp in self.spans:
+            # disjoint
+            if sp.end <= a or sp.start >= b:
+                new_spans.append(sp)
+                continue
+
+            # overlap: split into up to 3 pieces
+            left_s, left_e = sp.start, max(sp.start, a)
+            mid_s, mid_e = max(sp.start, a), min(sp.end, b)
+            right_s, right_e = min(sp.end, b), sp.end
+
+            if left_e > left_s:
+                new_spans.append(Span(left_s, left_e, set(sp.attrs)))
+
+            if mid_e > mid_s:
+                mid_attrs = set(sp.attrs)
+                mid_attrs.add(attr)
+                new_spans.append(Span(mid_s, mid_e, mid_attrs))
+
+            if right_e > right_s:
+                new_spans.append(Span(right_s, right_e, set(sp.attrs)))
+
+        # Also cover gaps where there was no span at all
+        # by adding a new span with just {attr} for uncovered parts.
+        gaps = self._subtract_covered_by_any_span(a, b)
+        for gs, ge in gaps:
+            new_spans.append(Span(gs, ge, {attr}))
+
+        self.spans = sorted(new_spans, key=lambda s: (s.start, s.end))
+
+    def _remove_attr_range(self, a: int, b: int, attr: str) -> None:
+        """Remove attr from [a,b), splitting spans as needed."""
+        new_spans: List[Span] = []
+        for sp in self.spans:
+            if sp.end <= a or sp.start >= b or attr not in sp.attrs:
+                new_spans.append(sp)
+                continue
+
+            left_s, left_e = sp.start, max(sp.start, a)
+            mid_s, mid_e = max(sp.start, a), min(sp.end, b)
+            right_s, right_e = min(sp.end, b), sp.end
+
+            if left_e > left_s:
+                new_spans.append(Span(left_s, left_e, set(sp.attrs)))
+
+            if mid_e > mid_s:
+                mid_attrs = set(sp.attrs)
+                mid_attrs.discard(attr)
+                if mid_attrs:
+                    new_spans.append(Span(mid_s, mid_e, mid_attrs))
+                # else drop it completely
+
+            if right_e > right_s:
+                new_spans.append(Span(right_s, right_e, set(sp.attrs)))
+
+        self.spans = sorted(new_spans, key=lambda s: (s.start, s.end))
+
+    def _subtract_covered_by_any_span(self, a: int, b: int) -> List[Tuple[int, int]]:
+        """Return gaps in [a,b) that are not covered by ANY existing span (any attrs)."""
+        spans = sorted(self.spans, key=lambda s: (s.start, s.end))
+        cur = a
+        gaps: List[Tuple[int, int]] = []
+        for sp in spans:
+            if sp.end <= cur:
+                continue
+            if sp.start >= b:
+                break
+            if sp.start > cur:
+                gaps.append((cur, min(sp.start, b)))
+            cur = max(cur, sp.end)
+            if cur >= b:
+                break
+        if cur < b:
+            gaps.append((cur, b))
+        return [(s, e) for s, e in gaps if e > s]
+
+    def _normalize_spans(self) -> None:
+        """Merge adjacent spans with identical attrs. Clamp to text length."""
+        self._clamp_spans()
+        if not self.spans:
+            return
+        merged: List[Span] = []
+        for sp in sorted(self.spans, key=lambda s: (s.start, s.end)):
+            if not sp.attrs:
+                continue
+            if not merged:
+                merged.append(sp)
+                continue
+            prev = merged[-1]
+            if prev.end == sp.start and prev.attrs == sp.attrs:
+                merged[-1] = Span(prev.start, sp.end, set(prev.attrs))
+            else:
+                merged.append(sp)
+        self.spans = merged
 
 # ---------- XML format ----------
 
@@ -409,10 +548,264 @@ def repl(initial_path: Optional[str]) -> int:
             return 0
 
         print("Unknown command. Type :help")
+# ---------- curses editor v1 (typing + cursor + save/quit) ----------
+
+import curses
+
+def _build_line_index(text: str):
+    """
+    Returns (lines, starts)
+    lines: list[str] each line WITHOUT trailing '\n' (except empty last)
+    starts: list[int] starting absolute index in text for each line
+    """
+    # Keep '\n' out of lines for simpler rendering
+    raw = text.splitlines(True)  # keepends
+    lines = []
+    starts = []
+    pos = 0
+    if not raw:
+        return [""], [0]
+    for chunk in raw:
+        starts.append(pos)
+        if chunk.endswith("\n"):
+            lines.append(chunk[:-1])
+            pos += len(chunk)
+        else:
+            lines.append(chunk)
+            pos += len(chunk)
+    # If text ends with '\n', splitlines(True) gives last chunk ending in '\n'
+    # and no empty line. Add a trailing empty line for cursor placement.
+    if text.endswith("\n"):
+        starts.append(pos)
+        lines.append("")
+    return lines, starts
+
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return lo if v < lo else hi if v > hi else v
+
+def _line_col_from_pos(lines, starts, pos: int):
+    # Find last line whose start <= pos (linear is ok for v1)
+    i = 0
+    for j in range(len(starts)):
+        if starts[j] <= pos:
+            i = j
+        else:
+            break
+    col = pos - starts[i]
+    col = _clamp(col, 0, len(lines[i]))
+    return i, col
+
+def _pos_from_line_col(lines, starts, line: int, col: int):
+    line = _clamp(line, 0, len(lines) - 1)
+    col = _clamp(col, 0, len(lines[line]))
+    return starts[line] + col
+
+def _insert(doc: "Document", pos: int, s: str) -> int:
+    doc.text = doc.text[:pos] + s + doc.text[pos:]
+    doc._clamp_spans()
+    doc.dirty = True
+    return pos + len(s)
+
+def _delete_backspace(doc: "Document", pos: int) -> int:
+    if pos <= 0:
+        return 0
+    doc.text = doc.text[:pos-1] + doc.text[pos:]
+    doc._clamp_spans()
+    doc.dirty = True
+    return pos - 1
+
+def curses_editor(doc: "Document") -> int:
+    """
+    Keys:
+      Arrows: move
+      PgUp/PgDn: scroll page
+      Home/End: line start/end
+      F7: save
+      Ctrl+X or F10: quit
+    """
+    def _run(stdscr):
+        curses.curs_set(1)
+        stdscr.keypad(True)
+        curses.noecho()
+        curses.cbreak()
+
+        cursor_pos = 0
+        preferred_col = 0
+        top_line = 0
+        msg = ""
+
+        # Start cursor at end of text (optional)
+        cursor_pos = len(doc.text)
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            view_h = max(1, h - 1)  # last line is status bar
+
+            lines, starts = _build_line_index(doc.text)
+            cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
+
+            # Ensure cursor line visible
+            if cur_line < top_line:
+                top_line = cur_line
+            elif cur_line >= top_line + view_h:
+                top_line = cur_line - view_h + 1
+            top_line = _clamp(top_line, 0, max(0, len(lines) - 1))
+
+            # Render text area
+            for row in range(view_h):
+                li = top_line + row
+                if li >= len(lines):
+                    break
+                # Clip to width
+                s = lines[li]
+                if len(s) > w:
+                    s = s[:w]
+                stdscr.addstr(row, 0, s)
+
+            # Status bar
+            name = str(doc.path) if doc.path else "(no file)"
+            dirty = "*" if doc.dirty else ""
+            status = f"{name}{dirty}  Ln {cur_line+1}, Col {cur_col+1}  F7/Ctrl+S Save  Ctrl+Q Quit"
+            if msg:
+                # show message at end if space
+                status = status[:max(0, w - 1)]
+                msg_part = (" | " + msg)[:max(0, w - 1 - len(status))]
+                status = status + msg_part
+            if len(status) < w:
+                status = status + (" " * (w - len(status) - 1))
+            stdscr.addstr(h - 1, 0, status[:max(0, w - 1)], curses.A_REVERSE)
+
+            # Place cursor
+            screen_y = cur_line - top_line
+            screen_x = _clamp(cur_col, 0, max(0, w - 1))
+            if 0 <= screen_y < view_h:
+                stdscr.move(screen_y, screen_x)
+
+            stdscr.refresh()
+            msg = ""
+
+            ch = stdscr.getch()
+
+            # Quit
+            if ch in (24,27):  # Ctrl+Q,, ESC
+                if doc.dirty:
+                    msg = "Unsaved changes. Press Q again to quit."
+                    stdscr.refresh()
+                    ch2 = stdscr.getch()
+                    if ch2 in (curses.KEY_F10, ord('q'), ord('Q'), 17):
+                        return 0
+                    continue
+                return 0
+
+            # Save
+            if ch == curses.KEY_F7:  # F7 or Ctrl+S
+                if not doc.path:
+                    msg = "No path. Use REPL mode to :save <path> once."
+                    continue
+                try:
+                    save_xml(doc.path, doc)
+                    msg = "Saved."
+                except Exception as e:
+                    msg = f"Save error: {e}"
+                continue
+
+            # Navigation
+            if ch == curses.KEY_LEFT:
+                cursor_pos = max(0, cursor_pos - 1)
+                cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
+                preferred_col = cur_col
+                continue
+
+            if ch == curses.KEY_RIGHT:
+                cursor_pos = min(len(doc.text), cursor_pos + 1)
+                cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
+                preferred_col = cur_col
+                continue
+
+            if ch == curses.KEY_UP:
+                new_line = max(0, cur_line - 1)
+                cursor_pos = _pos_from_line_col(lines, starts, new_line, preferred_col)
+                continue
+
+            if ch == curses.KEY_DOWN:
+                new_line = min(len(lines) - 1, cur_line + 1)
+                cursor_pos = _pos_from_line_col(lines, starts, new_line, preferred_col)
+                continue
+
+            if ch == curses.KEY_HOME:
+                cursor_pos = starts[cur_line]
+                preferred_col = 0
+                continue
+
+            if ch == curses.KEY_END:
+                cursor_pos = starts[cur_line] + len(lines[cur_line])
+                preferred_col = len(lines[cur_line])
+                continue
+
+            if ch == curses.KEY_NPAGE:  # Page Down
+                top_line = min(max(0, len(lines) - 1), top_line + view_h)
+                cur_line = min(len(lines) - 1, top_line)
+                cursor_pos = _pos_from_line_col(lines, starts, cur_line, preferred_col)
+                continue
+
+            if ch == curses.KEY_PPAGE:  # Page Up
+                top_line = max(0, top_line - view_h)
+                cur_line = top_line
+                cursor_pos = _pos_from_line_col(lines, starts, cur_line, preferred_col)
+                continue
+
+            # Editing
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                cursor_pos = _delete_backspace(doc, cursor_pos)
+                cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
+                preferred_col = cur_col
+                continue
+
+            if ch in (10, 13):  # Enter
+                cursor_pos = _insert(doc, cursor_pos, "\n")
+                preferred_col = 0
+                continue
+
+            if ch == 9:  # Tab -> 4 spaces
+                cursor_pos = _insert(doc, cursor_pos, "    ")
+                cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
+                preferred_col = cur_col
+                continue
+
+            # Printable characters
+            if 32 <= ch <= 126:
+                cursor_pos = _insert(doc, cursor_pos, chr(ch))
+                cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
+                preferred_col = cur_col
+                continue
+
+            # Ignore everything else
+            msg = f"Key {ch} ignored."
+
+    return curses.wrapper(_run)
+
 
 def main(argv: List[str]) -> int:
-    initial_path = argv[1] if len(argv) > 1 else None
-    return repl(initial_path)
+    use_curses = "--curses" in argv
+
+    # first non-flag argument is the file path
+    file_arg = next((a for a in argv[1:] if not a.startswith("-")), None)
+
+    doc = Document()
+    if file_arg:
+        p = Path(file_arg).expanduser()
+        if p.exists():
+            doc = load_xml(p)
+        else:
+            doc.path = p
+
+    if use_curses:
+        return curses_editor(doc)
+
+    # fallback to existing REPL
+    return repl(file_arg)
+
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
