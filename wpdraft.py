@@ -267,10 +267,23 @@ def load_xml(path: Path) -> Document:
     spans_el = root.find("spans")
     if spans_el is not None:
         for sp_el in spans_el.findall("span"):
+            # accept legacy start attribute "i" (typo) as "s"
+            if "s" not in sp_el.attrib and "i" in sp_el.attrib:
+                sp_el.attrib["s"] = sp_el.attrib["i"]
+
+            if "s" not in sp_el.attrib or "e" not in sp_el.attrib:
+                continue
+
             s = int(sp_el.attrib["s"])
             e = int(sp_el.attrib["e"])
             a = sp_el.attrib.get("a", "").strip()
             attrs = set(a.split()) if a else set()
+
+            # legacy: strike -> italics
+            if "s" in attrs:
+                attrs.remove("s")
+                attrs.add("i")
+
             if attrs:
                 doc.add_span(s, e, attrs)
                 doc.dirty = False  # add_span marks dirty; reset after load
