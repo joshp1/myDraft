@@ -624,6 +624,34 @@ def curses_editor(doc: "Document") -> int:
       Ctrl+X or F10: quit
     """
     def _run(stdscr):
+        def _attrs_at(pos: int) -> Set[str]:
+            # pos is absolute index into doc.text
+            # Non-partial-overlap spans makes this safe and predictable
+            out = set()
+            for sp in doc.spans:
+                if sp.start <= pos < sp.end:
+                    out |= sp.attrs
+            return out
+        stdscr.keypad (True)
+        curses.start_color()
+        curses.use_default_colors()
+
+        curses.init_pair(1, curses.COLOR_GREEN, -1) # bold
+        curses.init_pair(2, curses.COLOR_RED, -1) # underline
+        curses.init_pair(3, curses.COLOR_BLUE, -1)# strike
+
+
+        def _style_at(pos: int) -> int:
+            attrs = _attrs_at(pos)
+            style = 0
+            if "b" in attrs:
+                style |= curses.color_pair(1)
+            elif "u" in attrs:
+                style |= curses.color_pair(2)
+            elif "s" in attrs:
+                style |= curses.color_pair (3)
+            return style
+
         curses.curs_set(1)
         stdscr.keypad(True)
         curses.noecho()
@@ -681,24 +709,66 @@ def curses_editor(doc: "Document") -> int:
                 ov_a = max(sel_a, line_start)
                 ov_b = min(sel_b, line_start + len(vis))
 
-                if ov_a >= ov_b:
-                    stdscr.addstr(row, 0, vis)
-                    continue
-
                 # convert overlap to indices within this visible slice
                 pre_n = max(0, ov_a - line_start)
                 mid_n = max(0, ov_b - ov_a)
 
-                pre = vis[:pre_n]
-                mid = vis[pre_n:pre_n + mid_n]
-                post = vis[pre_n + mid_n:]
+                # Render text area with formatting + selection highlight
+                sel_a, sel_b = sorted((doc.sel_start, doc.sel_end))
 
-                if pre:
-                    stdscr.addstr(row, 0, pre)
-                if mid:
-                    stdscr.addstr(row, len(pre), mid, curses.A_REVERSE)
-                if post:
-                    stdscr.addstr(row, len(pre) + len(mid), post)
+                li = top_line + row
+                if li >= len(lines):
+                    break
+
+                line_text = lines[li]
+                line_start = starts[li]
+                vis = line_text[:w]
+                vis_len = len(vis)
+
+                # Build cut points (segment boundaries)
+                cuts = {0, vis_len}
+
+                # selection boundaries clipped to this line
+                sa = sel_a - line_start
+                sb = sel_b - line_start
+                if 0 < sa < vis_len: cuts.add(sa)
+                if 0 < sb < vis_len: cuts.add(sb)
+
+                # span boundaries clipped to visible slice
+                for sp in doc.spans:
+                    # span intersects this visible part of the line?
+                    if sp.end <= line_start or sp.start >= line_start + vis_len:
+                        continue
+                    rs = sp.start - line_start
+                    re = sp.end - line_start
+                    rs = max(0, min(rs, vis_len))
+                    re = max(0, min(re, vis_len))
+                    if 0 < rs < vis_len: cuts.add(rs)
+                    if 0 < re < vis_len: cuts.add(re)
+
+                points = sorted(cuts)
+
+                x = 0
+                for i in range(len(points) - 1):
+                    a = points[i]
+                    b = points[i + 1]
+                    if b <= a:
+                        continue
+
+                    seg = vis[a:b]
+                    if not seg:
+                        continue
+
+                    abs_pos = line_start + a
+
+                    style = _style_at(abs_pos)
+
+                    # selection overlay
+                    if sel_a <= abs_pos < sel_b:
+                        style |= curses.A_UNDERLINE
+
+                    stdscr.addstr(row, x, seg, style)
+                    x += len(seg)
 
 
             # Status bar
