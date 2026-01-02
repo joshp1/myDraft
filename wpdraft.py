@@ -300,7 +300,7 @@ def save_xml(path: Path, doc: Document) -> None:
     spans_el = ET.SubElement(root, "spans")
     for sp in sorted(doc.spans, key=lambda s: (s.start, s.end)):
         a = " ".join(sorted(sp.attrs))
-        ET.SubElement(spans_el, "span", {"i": str(sp.start), "e": str(sp.end), "a": a})
+        ET.SubElement(spans_el, "span", {"s": str(sp.start), "e": str(sp.end), "a": a})
 
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -662,6 +662,45 @@ def _build_line_index(text: str):
         lines.append("")
     return lines, starts
 
+def _prompt(stdscr, prompt: str, initial: str = "") -> str | None:
+    """
+    One-line input on the status bar row.
+    Returns string, or None if cancelled (ESC).
+    """
+    h, w = stdscr.getmaxyx()
+    y = h - 1
+    x = 0
+
+    curses.curs_set(1)
+    curses.echo()
+    curses.nocbreak()
+    stdscr.keypad(True)
+
+    buf = list(initial)
+    while True:
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        line = (prompt + "".join(buf))[: max(0, w - 1)]
+        stdscr.addstr(y, 0, line, curses.A_REVERSE)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (27,):  # ESC cancels
+            curses.noecho()
+            curses.cbreak()
+            return None
+        if ch in (10, 13):  # Enter accepts
+            curses.noecho()
+            curses.cbreak()
+            return "".join(buf).strip()
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            if buf:
+                buf.pop()
+            continue
+        if 32 <= ch <= 126:
+            buf.append(chr(ch))
+
+
 def _clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
 
@@ -786,6 +825,8 @@ def curses_editor(doc: "Document") -> int:
         preferred_col = 0
         top_line = 0
         msg = ""
+        leader = None  # None or "K"
+
 
         # Start cursor at end of text (optional)
         cursor_pos = len(doc.text)
@@ -932,11 +973,11 @@ def curses_editor(doc: "Document") -> int:
             base = f"{name}{dirty} {flags} Ln {cur_line+1}:{cur_col+1} Sel {sel_len}"
 
             if status_mode == 0:
-                keys = "ctrl+k Mode  F2 Marks  F4 Mark  F7 Save  Ctrl+X Quit"
+                keys = "Ctrl+K,C Mode  Ctrl+K,A SaveAs  Ctrl+K,S Save  F2 Marks  F4 Mark  Ctrl+X Quit"
             elif status_mode == 1:
-                keys = "Ctrl+k Mode  F7 Save  F8 Export MD  F9 Export BBCode"
+                keys = "Ctrl+K,C Mode  Ctrl+K,A SaveAs  Ctrl+K,S Save  F8 Export MD  F9 Export BBCode"
             else:
-                keys = "Ctrl+k Mode  Ctrl+B Bold  Ctrl+U Under  Ctrl+Y Italics"
+                keys = "Ctrl+K,C Mode  Ctrl+B Bold  Ctrl+U Under  Ctrl+Y Italic  F4 Mark"
 
             status = base + "  " + keys
             if msg:
@@ -1000,9 +1041,49 @@ def curses_editor(doc: "Document") -> int:
                     msg = f"Export BBCode error: {e}"
                 continue
 
-            if ch == 11:
-                status_mode = (status_mode + 1) % 3
-                msg = "HELP" if status_mode == 0 else "FILE" if status_mode == 1 else "FORMAT"
+
+            # Ctrl+K leader
+            if ch == 11:  # Ctrl+K
+                leader = "K"
+                msg = "K-"
+                continue
+
+
+            if leader == "K":
+                leader = None
+
+                # Cycle mode (keeps your old behavior)
+                if ch in (ord('c'), ord('C')):
+                    status_mode = (status_mode + 1) % 3
+                    msg = "HELP" if status_mode == 0 else "FILE" if status_mode == 1 else "FORMAT"
+                    continue
+
+                # Save
+                if ch in (ord('s'), ord('S')):
+                    if not doc.path:
+                        s = _prompt(stdscr, "Save as: ", "")
+                        if not s:
+                            msg = "Save cancelled."
+                            continue
+                        doc.path = Path(s).expanduser()
+                    save_xml(doc.path, doc)
+                    msg = "Saved."
+                    continue
+
+                # Save As
+                if ch in (ord('a'), ord('A')):
+                    default = str(doc.path) if doc.path else ""
+                    s = _prompt(stdscr, "Save as: ", default)
+                    if not s:
+                        msg = "Save as cancelled."
+                        continue
+                    doc.path = Path(s).expanduser()
+                    save_xml(doc.path, doc)
+                    msg = f"Saved {doc.path.name}"
+                    continue
+
+                # Unknown K-command
+                msg = "Unknown K command"
                 continue
 
             # ctrl+u (21)
