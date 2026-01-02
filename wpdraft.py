@@ -645,11 +645,11 @@ def curses_editor(doc: "Document") -> int:
             attrs = _attrs_at(pos)
             style = 0
             if "b" in attrs:
-                style |= curses.color_pair(1)
+                style |= curses.A_BOLD
             elif "u" in attrs:
-                style |= curses.color_pair(2)
+                style |= curses.A_UNDERLINE
             elif "s" in attrs:
-                style |= curses.color_pair (3)
+                style |= curses.A_BLINK
             return style
 
         curses.curs_set(1)
@@ -764,8 +764,10 @@ def curses_editor(doc: "Document") -> int:
                     style = _style_at(abs_pos)
 
                     # selection overlay
-                    if sel_a <= abs_pos < sel_b:
-                        style |= curses.A_UNDERLINE
+                    seg_a = abs_pos
+                    seg_b = abs_pos + (b - a)  # end-exclusive
+                    if not (seg_b <= sel_a or seg_a >= sel_b):
+                        style |= curses.A_REVERSE
 
                     stdscr.addstr(row, x, seg, style)
                     x += len(seg)
@@ -810,6 +812,18 @@ def curses_editor(doc: "Document") -> int:
                     msg = f"Bold error: {e}"
                 continue
 
+            # ctrl+u (21)
+            if ch == 21:
+                doc.toggle_attr_on_selection("u")
+                msg = "underline toggled"
+                continue
+
+            # ctrl+T (20) or pick another for strickthrough
+            if ch ==20:
+                doc.toggle_attr_on_selection("s")
+                msg = "strike togggled."
+                continue
+            
             # Quit
             if ch in (24,27):  # Ctrl+Q,, ESC
                 if doc.dirty:
