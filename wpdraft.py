@@ -636,6 +636,16 @@ def curses_editor(doc: "Document") -> int:
 
         # Start cursor at end of text (optional)
         cursor_pos = len(doc.text)
+        select_anchor = None  # None or int absolute position
+
+        def _sync_selection():
+            nonlocal select_anchor, cursor_pos
+            if select_anchor is None:
+                doc.set_selection(cursor_pos, cursor_pos)
+            else:
+                doc.set_selection(select_anchor, cursor_pos)
+
+        _sync_selection()
 
         while True:
             stdscr.erase()
@@ -653,20 +663,49 @@ def curses_editor(doc: "Document") -> int:
             top_line = _clamp(top_line, 0, max(0, len(lines) - 1))
 
             # Render text area
+            sel_a, sel_b = sorted((doc.sel_start, doc.sel_end))
+
             for row in range(view_h):
                 li = top_line + row
                 if li >= len(lines):
                     break
-                # Clip to width
-                s = lines[li]
-                if len(s) > w:
-                    s = s[:w]
-                stdscr.addstr(row, 0, s)
+
+                line_text = lines[li]
+                line_start = starts[li]
+                line_end = line_start + len(line_text)
+
+                # clip to width for display
+                vis = line_text[:w]
+
+                # compute overlap of selection with this line
+                ov_a = max(sel_a, line_start)
+                ov_b = min(sel_b, line_start + len(vis))
+
+                if ov_a >= ov_b:
+                    stdscr.addstr(row, 0, vis)
+                    continue
+
+                # convert overlap to indices within this visible slice
+                pre_n = max(0, ov_a - line_start)
+                mid_n = max(0, ov_b - ov_a)
+
+                pre = vis[:pre_n]
+                mid = vis[pre_n:pre_n + mid_n]
+                post = vis[pre_n + mid_n:]
+
+                if pre:
+                    stdscr.addstr(row, 0, pre)
+                if mid:
+                    stdscr.addstr(row, len(pre), mid, curses.A_REVERSE)
+                if post:
+                    stdscr.addstr(row, len(pre) + len(mid), post)
+
 
             # Status bar
             name = str(doc.path) if doc.path else "(no file)"
             dirty = "*" if doc.dirty else ""
-            status = f"{name}{dirty}  Ln {cur_line+1}, Col {cur_col+1}  F7/Ctrl+S Save  Ctrl+Q Quit"
+            sel_len = abs(doc.sel_end - doc.sel_start)
+            status = f"{name}{dirty}  Ln {cur_line+1}, Col {cur_col+1}  Sel {sel_len}  F4 Mark  Ctrl+B Bold  F7 Save  Ctrl+X Quit"
             if msg:
                 # show message at end if space
                 status = status[:max(0, w - 1)]
@@ -686,6 +725,20 @@ def curses_editor(doc: "Document") -> int:
             msg = ""
 
             ch = stdscr.getch()
+            msg = f"key={ch} sel={doc.sel_start}-{doc.sel_end}"
+        
+            # Toggle bold on selection (Ctrl+B)
+            if ch == 2:  # Ctrl+B
+                a, b = sorted((doc.sel_start, doc.sel_end))
+                if a == b:
+                    msg = "No selection."
+                    continue
+                try:
+                    doc.toggle_attr_on_selection("b")
+                    msg = "Bold toggled."
+                except Exception as e:
+                    msg = f"Bold error: {e}"
+                continue
 
             # Quit
             if ch in (24,27):  # Ctrl+Q,, ESC
@@ -715,45 +768,70 @@ def curses_editor(doc: "Document") -> int:
                 cursor_pos = max(0, cursor_pos - 1)
                 cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
                 preferred_col = cur_col
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_RIGHT:
                 cursor_pos = min(len(doc.text), cursor_pos + 1)
                 cur_line, cur_col = _line_col_from_pos(lines, starts, cursor_pos)
                 preferred_col = cur_col
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_UP:
                 new_line = max(0, cur_line - 1)
                 cursor_pos = _pos_from_line_col(lines, starts, new_line, preferred_col)
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_DOWN:
                 new_line = min(len(lines) - 1, cur_line + 1)
                 cursor_pos = _pos_from_line_col(lines, starts, new_line, preferred_col)
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_HOME:
                 cursor_pos = starts[cur_line]
                 preferred_col = 0
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_END:
                 cursor_pos = starts[cur_line] + len(lines[cur_line])
                 preferred_col = len(lines[cur_line])
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_NPAGE:  # Page Down
                 top_line = min(max(0, len(lines) - 1), top_line + view_h)
                 cur_line = min(len(lines) - 1, top_line)
                 cursor_pos = _pos_from_line_col(lines, starts, cur_line, preferred_col)
+                _sync_selection()
                 continue
 
             if ch == curses.KEY_PPAGE:  # Page Up
                 top_line = max(0, top_line - view_h)
                 cur_line = top_line
                 cursor_pos = _pos_from_line_col(lines, starts, cur_line, preferred_col)
+                _sync_selection()
                 continue
+
+            # Toggle selection block (F4)
+            if ch == curses.KEY_F4:
+                if select_anchor is None:
+                    select_anchor = cursor_pos
+                else:
+                    select_anchor = None
+                _sync_selection()
+                continue
+
+            # Clear selection (ESC) but keep ESC quit as emergency if you want
+            # If you want ESC to clear selection first:
+            if ch == 27 and select_anchor is not None:
+                select_anchor = None
+                _sync_selection()
+                continue
+
 
             # Editing
             if ch in (curses.KEY_BACKSPACE, 127, 8):
