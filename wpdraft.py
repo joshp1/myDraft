@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 wpdraft.py
 Minimal drafting core:
@@ -377,6 +378,74 @@ def export_markdown(doc: Document) -> str:
 
     return "".join(out)
 
+# ------------- BBCode export ------------
+def export_bbcode(doc: Document) -> str:
+    """
+    Export spans into BBCode.
+    - b -> [b]...[/b]
+    - u -> [u]...[/u]
+    - s -> [s]...[/s]
+    """
+    text = doc.text
+    n = len(text)
+
+    opens: List[List[Tuple[int, str]]] = [[] for _ in range(n + 1)]
+    closes: List[List[Tuple[int, str]]] = [[] for _ in range(n + 1)]
+
+    def open_token(attr: str) -> str:
+        if attr == "b": return "[b]"
+        if attr == "u": return "[u]"
+        if attr == "s": return "[s]"
+        raise ValueError(attr)
+
+    def close_token(attr: str) -> str:
+        if attr == "b": return "[/b]"
+        if attr == "u": return "[/u]"
+        if attr == "s": return "[/s]"
+        raise ValueError(attr)
+
+    for sp in doc.spans:
+        for attr in sorted(sp.attrs):
+            opens[sp.start].append((sp.end - sp.start, attr))
+            closes[sp.end].append((sp.end - sp.start, attr))
+
+    for i in range(n + 1):
+        opens[i].sort(key=lambda t: (-t[0], t[1]))   # outer first
+        closes[i].sort(key=lambda t: (t[0], t[1]))   # inner first
+
+    out: List[str] = []
+    for i, ch in enumerate(text):
+        for _, attr in opens[i]:
+            out.append(open_token(attr))
+        out.append(ch)
+        for _, attr in closes[i + 1]:
+            out.append(close_token(attr))
+
+    if n == 0:
+        for _, attr in opens[0]:
+            out.append(open_token(attr))
+        for _, attr in closes[0]:
+            out.append(close_token(attr))
+
+    return "".join(out)
+
+# ----------- text file writer -----------
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
 
 # ---------- Minimal command UI ----------
 
@@ -624,6 +693,8 @@ def curses_editor(doc: "Document") -> int:
       Ctrl+X or F10: quit
     """
     def _run(stdscr):
+        status_mode = 0  # 0=HELP, 1=FILE, 2=FORMAT
+
         def _attrs_at(pos: int) -> Set[str]:
             # pos is absolute index into doc.text
             # Non-partial-overlap spans makes this safe and predictable
@@ -632,7 +703,20 @@ def curses_editor(doc: "Document") -> int:
                 if sp.start <= pos < sp.end:
                     out |= sp.attrs
             return out
+        
+        def _status_flags_at(pos: int) -> str:
+            if not doc.text:
+                return ""
+            # if cursor is at end, look at previous char so flags still show
+            p = pos if pos < len(doc.text) else max(0, len(doc.text) - 1)
+            a = _attrs_at(p)
+            out = []
+            if "b" in a: out.append("B")
+            if "u" in a: out.append("U")
+            if "s" in a: out.append("S")
+            return "[" + "][".join(out) + "]" if out else ""
         stdscr.keypad (True)
+        show_markers = False
         curses.start_color()
         curses.use_default_colors()
 
@@ -652,8 +736,36 @@ def curses_editor(doc: "Document") -> int:
                 style |= curses.A_BLINK
             return style
 
+        def _markers_at(pos: int) -> list[tuple[str, int]]:
+            """
+            Return marker tokens to display at absolute position pos.
+            We show tokens at BOTH span start and span end (toggle style).
+            """
+            out: list[tuple[str, int]] = []
+            for sp in doc.spans:
+                if sp.start == pos or sp.end == pos:
+                    for a in sp.attrs:
+                        if a == "b":
+                            out.append(("^b", curses.color_pair(1)))
+                        elif a == "u":
+                            out.append(("^u", curses.A_UNDERLINE))
+                        elif a == "s":
+                            out.append(("^s", curses.color_pair(3)))
+            return out
+
+        def _marker_width_before(line_start: int, pos: int) -> int:
+            """How many marker columns would be inserted in [line_start, pos)?"""
+            extra = 0
+            for sp in doc.spans:
+                for boundary in (sp.start, sp.end):
+                    if line_start <= boundary < pos:
+                        # one token per attr on that span at that boundary
+                        for a in sp.attrs:
+                            extra += 2  # len("^b") etc
+            return extra
+
+
         curses.curs_set(1)
-        stdscr.keypad(True)
         curses.noecho()
         curses.cbreak()
 
@@ -759,17 +871,37 @@ def curses_editor(doc: "Document") -> int:
                     if not seg:
                         continue
 
-                    abs_pos = line_start + a
+                    seg = vis[a:b]
+                    if not seg:
+                        continue
 
-                    style = _style_at(abs_pos)
+                    seg_a = line_start + a
+                    seg_b = line_start + b
 
-                    # selection overlay
-                    seg_a = abs_pos
-                    seg_b = abs_pos + (b - a)  # end-exclusive
+                    # 1) markers at segment start
+                    if show_markers:
+                        for tok, tok_style in _markers_at(seg_a):
+                            remaining = w - x
+                            if remaining <= 0:
+                                break
+                            t = tok[:remaining]
+                            stdscr.addstr(row, x, t, tok_style | curses.A_DIM)
+                            x += len(t)
+
+                    # 2) style for the actual text
+                    style = _style_at(seg_a)
+
+                    # 3) selection overlay (OVERLAP, not start-only)
                     if not (seg_b <= sel_a or seg_a >= sel_b):
-                        style |= curses.A_REVERSE
+                        style |= curses.A_REVERSE   # or A_UNDERLINE
 
-                    stdscr.addstr(row, x, seg, style)
+                    # 4) draw the text segment
+                    remaining = w - x
+                    if remaining <= 0:
+                        break
+                    seg2 = seg[:remaining]
+
+                    stdscr.addstr(row, x, seg2, style)
                     x += len(seg)
 
 
@@ -777,10 +909,27 @@ def curses_editor(doc: "Document") -> int:
             name = str(doc.path) if doc.path else "(no file)"
             dirty = "*" if doc.dirty else ""
             sel_len = abs(doc.sel_end - doc.sel_start)
-            status = f"{name}{dirty}  Ln {cur_line+1}, Col {cur_col+1}  Sel {sel_len}  F4 Mark  Ctrl+B Bold  F7 Save  Ctrl+X Quit"
+            flags = _status_flags_at(cursor_pos)
+
+            name = str(doc.path) if doc.path else "(no file)"
+            dirty = "*" if doc.dirty else ""
+            sel_len = abs(doc.sel_end - doc.sel_start)
+            flags = _status_flags_at(cursor_pos)
+
+            base = f"{name}{dirty} {flags} Ln {cur_line+1}:{cur_col+1} Sel {sel_len}"
+
+            if status_mode == 0:
+                keys = "ctrl+k Mode  F2 Marks  F4 Mark  F7 Save  Ctrl+X Quit"
+            elif status_mode == 1:
+                keys = "Ctrl+k Mode  F7 Save  F8 Export MD  F9 Export BBCode"
+            else:
+                keys = "Ctrl+k Mode  Ctrl+B Bold  Ctrl+U Under  Ctrl+T Strike"
+
+            status = base + "  " + keys
             if msg:
                 # show message at end if space
                 status = status[:max(0, w - 1)]
+                stdscr.addstr(h - 1, 0, status, curses.A_REVERSE)
                 msg_part = (" | " + msg)[:max(0, w - 1 - len(status))]
                 status = status + msg_part
             if len(status) < w:
@@ -812,7 +961,39 @@ def curses_editor(doc: "Document") -> int:
                     msg = f"Bold error: {e}"
                 continue
 
+            # Export Markdown (F8)
+            if ch == curses.KEY_F8:
+                if not doc.path:
+                    msg = "No file path. Save once (F7) to set a path."
+                    continue
+                try:
+                    out_path = doc.path.with_suffix(".md")
+                    write_text_atomic(out_path, export_markdown(doc))
+                    msg = f"Exported {out_path.name}"
+                except Exception as e:
+                    msg = f"Export MD error: {e}"
+                continue
+
+            # Export BBCode (F9)
+            if ch == curses.KEY_F9:
+                if not doc.path:
+                    msg = "No file path. Save once (F7) to set a path."
+                    continue
+                try:
+                    out_path = doc.path.with_suffix(".bbcode")
+                    write_text_atomic(out_path, export_bbcode(doc))
+                    msg = f"Exported {out_path.name}"
+                except Exception as e:
+                    msg = f"Export BBCode error: {e}"
+                continue
+
+            if ch == 11:
+                status_mode = (status_mode + 1) % 3
+                msg = "HELP" if status_mode == 0 else "FILE" if status_mode == 1 else "FORMAT"
+                continue
+
             # ctrl+u (21)
+
             if ch == 21:
                 doc.toggle_attr_on_selection("u")
                 msg = "underline toggled"
@@ -834,6 +1015,13 @@ def curses_editor(doc: "Document") -> int:
                         return 0
                     continue
                 return 0
+
+            # Toggle marker view (F2)
+            if ch == curses.KEY_F2:
+                show_markers = not show_markers
+                msg = "Markers ON" if show_markers else "Markers OFF"
+                continue
+
 
             # Save
             if ch == curses.KEY_F7:  # F7 or Ctrl+S
