@@ -27,7 +27,7 @@ import tempfile
 
 # ---------- Document model ----------
 
-ALLOWED_ATTRS = {"b", "u", "s"}  # bold, underline, strike
+ALLOWED_ATTRS = {"b", "u", "i"}  # bold, underline, italics
 
 
 @dataclass(order=True)
@@ -287,7 +287,7 @@ def save_xml(path: Path, doc: Document) -> None:
     spans_el = ET.SubElement(root, "spans")
     for sp in sorted(doc.spans, key=lambda s: (s.start, s.end)):
         a = " ".join(sorted(sp.attrs))
-        ET.SubElement(spans_el, "span", {"s": str(sp.start), "e": str(sp.end), "a": a})
+        ET.SubElement(spans_el, "span", {"i": str(sp.start), "e": str(sp.end), "a": a})
 
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -318,7 +318,7 @@ def export_markdown(doc: Document) -> str:
     Export spans into Markdown.
     Rules:
     - Bold -> **...**
-    - Strike -> ~~...~~
+    - Italics -> *...*
     - Underline -> <u>...</u>  (Markdown has no standard underline)
     Overlap rule: no partial overlap (enforced).
     """
@@ -332,8 +332,8 @@ def export_markdown(doc: Document) -> str:
     def open_token(attr: str) -> str:
         if attr == "b":
             return "**"
-        if attr == "s":
-            return "~~"
+        if attr == "i":
+            return "*"
         if attr == "u":
             return "<u>"
         raise ValueError(attr)
@@ -341,8 +341,8 @@ def export_markdown(doc: Document) -> str:
     def close_token(attr: str) -> str:
         if attr == "b":
             return "**"
-        if attr == "s":
-            return "~~"
+        if attr == "i":
+            return "*"
         if attr == "u":
             return "</u>"
         raise ValueError(attr)
@@ -384,7 +384,7 @@ def export_bbcode(doc: Document) -> str:
     Export spans into BBCode.
     - b -> [b]...[/b]
     - u -> [u]...[/u]
-    - s -> [s]...[/s]
+    - i -> [i]...[/i]
     """
     text = doc.text
     n = len(text)
@@ -395,13 +395,13 @@ def export_bbcode(doc: Document) -> str:
     def open_token(attr: str) -> str:
         if attr == "b": return "[b]"
         if attr == "u": return "[u]"
-        if attr == "s": return "[s]"
+        if attr == "i": return "[i]"
         raise ValueError(attr)
 
     def close_token(attr: str) -> str:
         if attr == "b": return "[/b]"
         if attr == "u": return "[/u]"
-        if attr == "s": return "[/s]"
+        if attr == "i": return "[/i]"
         raise ValueError(attr)
 
     for sp in doc.spans:
@@ -450,13 +450,13 @@ def write_text_atomic(path: Path, content: str) -> None:
 # ---------- Minimal command UI ----------
 
 HELP = """Commands:
-  :help                         Show help
-  :show                         Show current text (with indexes)
+  :help                          Show help
+  :show                          Show current text (with indexes)
   :set                           Replace text (multiline; end with a single dot '.' line)
   :append                        Append text (multiline; end with '.' line)
   :bold <start> <end>            Apply bold span
   :under <start> <end>           Apply underline span (exports as <u>..</u>)
-  :strike <start> <end>          Apply strike span
+  :italics <start> <end>         Apply italics span
   :clearspans                    Remove all spans
   :save [path]                   Save XML (default: current path)
   :open <path>                   Load XML
@@ -548,7 +548,7 @@ def repl(initial_path: Optional[str]) -> int:
                 elif cmd.startswith(":under "):
                     doc.add_span(start, end, {"u"})
                 else:
-                    doc.add_span(start, end, {"s"})
+                    doc.add_span(start, end, {"i"})
             except Exception as e:
                 print(f"Error: {e}")
             continue
@@ -713,7 +713,7 @@ def curses_editor(doc: "Document") -> int:
             out = []
             if "b" in a: out.append("B")
             if "u" in a: out.append("U")
-            if "s" in a: out.append("S")
+            if "i" in a: out.append("i")
             return "[" + "][".join(out) + "]" if out else ""
         stdscr.keypad (True)
         show_markers = False
@@ -732,8 +732,8 @@ def curses_editor(doc: "Document") -> int:
                 style |= curses.A_BOLD
             elif "u" in attrs:
                 style |= curses.A_UNDERLINE
-            elif "s" in attrs:
-                style |= curses.A_BLINK
+            elif "i" in attrs:
+                style |= curses.A_ITALIC
             return style
 
         def _markers_at(pos: int) -> list[tuple[str, int]]:
@@ -749,8 +749,8 @@ def curses_editor(doc: "Document") -> int:
                             out.append(("^b", curses.color_pair(1)))
                         elif a == "u":
                             out.append(("^u", curses.A_UNDERLINE))
-                        elif a == "s":
-                            out.append(("^s", curses.color_pair(3)))
+                        elif a == "i":
+                            out.append(("^i", curses.A_ITALIC))
             return out
 
         def _marker_width_before(line_start: int, pos: int) -> int:
@@ -923,7 +923,7 @@ def curses_editor(doc: "Document") -> int:
             elif status_mode == 1:
                 keys = "Ctrl+k Mode  F7 Save  F8 Export MD  F9 Export BBCode"
             else:
-                keys = "Ctrl+k Mode  Ctrl+B Bold  Ctrl+U Under  Ctrl+T Strike"
+                keys = "Ctrl+k Mode  Ctrl+B Bold  Ctrl+U Under  Ctrl+Y Italics"
 
             status = base + "  " + keys
             if msg:
@@ -999,10 +999,10 @@ def curses_editor(doc: "Document") -> int:
                 msg = "underline toggled"
                 continue
 
-            # ctrl+T (20) or pick another for strickthrough
-            if ch ==20:
-                doc.toggle_attr_on_selection("s")
-                msg = "strike togggled."
+            # ctrl+T (25) or pick another for strickthrough
+            if ch ==25:
+                doc.toggle_attr_on_selection("i")
+                msg = "Italics togggled."
                 continue
             
             # Quit
