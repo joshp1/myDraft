@@ -1,0 +1,128 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>myDraft (web)</title>
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;max-width:1000px;margin:18px auto;padding:0 12px}
+    #bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+    button{padding:6px 10px}
+    #ed{border:1px solid #ccc;border-radius:6px;padding:10px;min-height:60vh;white-space:pre-wrap}
+    #msg{margin-top:8px;font-size:14px}
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <button onclick="cmd('bold')"><b>B</b></button>
+    <button onclick="cmd('italic')"><i>I</i></button>
+    <button onclick="cmd('underline')"><u>U</u></button>
+    <button onclick="saveNow()">Save</button>
+    <button onclick="loadNow()">Reload</button>
+    <a href="data/latest.md" target="_blank">latest.md</a>
+    <a href="data/latest.bbcode" target="_blank">latest.bbcode</a>
+  </div>
+
+  <div id="ed" contenteditable="true" spellcheck="false"></div>
+  <div id="msg"></div>
+
+<script>
+const ed = document.getElementById("ed");
+const msg = document.getElementById("msg");
+
+function cmd(name){
+  document.execCommand(name, false, null);
+  ed.focus();
+}
+
+function setMsg(t){ msg.textContent = t; }
+
+function textAndSpansFromDom(root){
+  // Walk the DOM and build plain text + spans for b/i/u
+  let text = "";
+  const spans = [];
+  const stack = [];
+
+  function openAttr(a){ stack.push({a, start: text.length}); }
+  function closeAttr(a){
+    for (let i = stack.length - 1; i >= 0; i--){
+      if (stack[i].a === a){
+        const start = stack[i].start;
+        const end = text.length;
+        stack.splice(i, 1);
+        if (end > start) spans.push({s:start, e:end, a:[a]});
+        return;
+      }
+    }
+  }
+
+  function walk(node){
+    if (node.nodeType === Node.TEXT_NODE){
+      text += node.nodeValue;
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const tag = node.tagName.toLowerCase();
+    const opens = [];
+    if (tag === "b" || tag === "strong"){ openAttr("b"); opens.push("b"); }
+    if (tag === "i" || tag === "em"){ openAttr("i"); opens.push("i"); }
+    if (tag === "u"){ openAttr("u"); opens.push("u"); }
+    if (tag === "br"){ text += "\n"; return; }
+    if (tag === "div"){
+      // contenteditable often uses divs for lines. Handle line breaks.
+      // Walk children, then add newline except for last div.
+      for (let c of node.childNodes) walk(c);
+      text += "\n";
+    } else {
+      for (let c of node.childNodes) walk(c);
+    }
+
+    for (let j = opens.length - 1; j >= 0; j--){
+      closeAttr(opens[j]);
+    }
+  }
+
+  // Clear trailing newline added by div logic
+  walk(root);
+  if (text.endsWith("\n")) text = text.slice(0, -1);
+
+  // Merge spans with same attr if adjacent
+  spans.sort((x,y)=>x.s-y.s || x.e-y.e);
+  const merged = [];
+  for (const sp of spans){
+    const a = sp.a[0];
+    const prev = merged[merged.length-1];
+    if (prev && prev.a[0] === a && prev.e === sp.s){
+      prev.e = sp.e;
+    } else {
+      merged.push(sp);
+    }
+  }
+  return {text, spans: merged};
+}
+
+async function saveNow(){
+  const model = textAndSpansFromDom(ed);
+  const r = await fetch("save", {
+    method:"POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(model)
+  });
+  if (!r.ok){ setMsg("Save failed"); return; }
+  setMsg("Saved");
+}
+
+async function loadNow(){
+  const r = await fetch("load", {cache:"no-store"});
+  const j = await r.json();
+  // Minimal render: just plain text into div.
+  // Formatting not restored in v1. (You can add render later.)
+  ed.textContent = j.text || "";
+  setMsg("Loaded");
+}
+
+loadNow();
+</script>
+</body>
+</html>
